@@ -1,0 +1,1060 @@
+;===============================================================================
+; Title: Digital Alarm Clock with FM radio.
+;
+; Author: Rob Jansen, Copyright (c) 2023..2023, all rights reserved.
+;
+; Revisions
+; ---------
+; 2023-02-11 : Initial version
+; 2023-07-14 : Increased display hold time from 2 to 3 seconds. Disabled active
+;              alarm when changing alarm type or switching alarm off.
+; 2023-07-23 : All keys will turn on the display shortly when it is off. 
+;              Changed control for setting the time from 'Preset' to 'Hour' and
+;              'Minute' the same as used for setting the alarm time.
+; 2023-08-04 : Fixed bug in alarm audio to be muted.
+;
+; Compiler: jalv25r8
+;
+; Description: Digital Alarm Clock capable of handling 2 different alarm times.
+;              The clock has an FM radio and the user can chooise between the 
+;              FM radio or a regular alarm via a tone. 
+;
+; Notes: 
+;
+; Sources: -
+;
+
+; ================== Constant and variable declarations =======================
+include 16f18075                      ; target PICmicro
+
+; This program uses the 8 MHz internal oscillator, which is fast enough for this application.
+pragma target clock 8_000_000         ; Oscillator frequency 8 MHz
+
+; Configuration memory settings (fuses). These are only a selection, sufficient
+; for this program.
+pragma target OSC      OFF             ; Internal oscillator
+pragma target RSTOSC   HFINTOSC_32MHZ  ; Select 32 MHz
+pragma target CLKOUTEN DISABLED        ; No clock output
+pragma target WDT      DISABLED        ; No watchdog
+pragma target BROWNOUT DISABLED        ; No brownout reset
+pragma target PPS1WAY  ENABLED         ; PPS can be set and cleared once (default)
+pragma target LVP      ENABLED         ; Low voltage programming
+pragma target MCLR     EXTERNAL        ; External reset.
+OSCFRQ_FRQ = 0b011                     ; Fosc 8 MHz
+
+; Enable weak pull-up for unconnected pins. See schematic diagram.
+WPUA = 0b1100_0000 ; RA7, RA6 unconnected.       
+WPUB = 0b1111_1111 ; All connected but pull-up is OK. 
+WPUC = 0b0000_0000 ; All connected.       
+WPUD = 0b1000_0000 ; D7 is unconnected.     
+WPUE = 0b0000_0000 ; All connected.       
+
+; Make all pins digital I/O.
+enable_digital_io()
+_usec_delay(500_000) ; Wait for the hardware to stabilize. 
+
+include pps
+pps_control_lock(FALSE)                
+RC3PPS = PPS_SCL1 ; Pin C3 assigned to the IIC clock (default)    
+RC4PPS = PPS_SDA1 ; Pin C4 assigned to the IIC data (default)  
+RC5PPS = PPS_PWM5 ; Pin C5 assigned to PWM5 (can be a on of port A or port C).   
+pps_control_lock(TRUE)   
+
+-- Settings for the IIC interface used by the DS3231 and the RDA5807M 
+alias i2c_scl is pin_C3
+alias pin_scl_direction is pin_C3_direction 
+alias i2c_sda is pin_C4
+alias pin_sda_direction is pin_C4_direction 
+const word _i2c_bus_speed = 1 -- 100kHz, max for RDA5807M
+const bit  _i2c_level = TRUE  -- i2c levels (not SMB)
+include i2c_hardware  
+-- Now included the libraries.
+include rtc_ds3231  ; This one uses the IIC interface.
+include display
+include keyboard
+include amplifier
+include beep
+include radio       ; This one uses the IIC interface too.
+
+; We need some delays.
+include delay
+
+; Declare the offset address for the EEPROM before including the library.
+const word EEPROM_ADDRESS_OFFSET = 0xF000
+include pic_data_eeprom
+
+; Definition of some EEPROM addresses.
+const byte EEPROM_ADDRESS_INIT       = 0 ; Size is 1 byte.
+const byte EEPROM_ADDRESS_ALARM_1    = 1 ; Size is 1 byte.
+const byte EEPROM_ADDRESS_ALARM_2    = 2 ; Size is 1 byte.
+const byte EEPROM_ADDRESS_BRIGHTNESS = 3 ; Size is 1 byte.
+const byte EEPROM_ADDRESS_VOLUME     = 4 ; Size is 1 byte.
+const byte EEPROM_ADDRESS_CHANNEL    = 5 ; Size is 1 byte.
+const byte EEPROM_ADDRESS_FREQUENCY  = 6 ; Size is 10 dwords.
+; We have to take the size of the frequency into account when accessing
+; the eeprom.
+const byte EEPROM_FREQUENCY_ADDRESS_SIZE = 4 ; Dwords.
+ 
+; Setting to indicated the EEPROM is empty.
+const byte EEPROM_EMPTY = 0xFF ; Erased EEPROM.
+
+; Definition of some alarm settings that we store in EEPROM.
+const byte ALARM_SETTING_OFF   = 0
+const byte ALARM_SETTING_RADIO = 1
+const byte ALARM_SETTING_BEEP  = 2
+
+; Clock states.
+const byte CLOCK_STATE_RUNNING          = 0
+const byte CLOCK_STATE_SET_TIME         = 1
+const byte CLOCK_STATE_SET_ALARM_TIME_1 = 2
+const byte CLOCK_STATE_SET_ALARM_TIME_2 = 3
+const byte CLOCK_STATE_SET_RADIO        = 4
+
+; Constant that determines the time the display is not updated showing
+; the previously set display information.
+; Timer tick is twice per second (see display).
+const byte DISPLAY_HOLD_TIME = 6 ; 3 Seconds.
+
+; Snooze time in seconds. Timer tick is twice per second (see display).
+const word SNOOZE_TIME = 840 ; 7 minutes
+
+; Fade-in time for the volume when an alarm is active in twice per second tick.
+const byte VOLUME_FADE_IN_TIME = 10
+
+; Sleep timer values. Timer tick is twice per second (see display).
+const word SLEEP_TIME_15 = 1800   ; 15 minutes
+const word SLEEP_TIME_30 = 3600   ; 30 minutes
+const word SLEEP_TIME_60 = 7200   ; 60 minutes
+const word SLEEP_TIME_90 = 10_800 ; 90 minutes
+
+; Maximum number of radio channels to store. 
+const byte MIN_RADIO_CHANNELS = 0  ; We start at 0 but we will show 1.
+const byte MAX_RADIO_CHANNELS = 10 ; Max is not used so 0 .. 9.
+
+; A preset value for the initial radio channels. The given frequency
+; is Sky Radio in Eindhoven, The Netherlands at 101.60 MHz
+const dword RADIO_INITIAL_PRESET = 101_600 ; Frequency in kHz.
+
+; Global variables.
+var dword radio_frequency
+var word snooze_timer, sleep_timer
+var byte clock_state, radio_channel
+var byte hours, minutes, seconds
+var byte alarm_setting_1, alarm_setting_2
+var byte volume_setting, brightness_setting
+var byte volume_fade_in, volume_fade_max, volume_fade_in_timer
+var byte display_hold_timer, index
+var bit alarm_1_active, alarm_2_active, initialize_alarm_volume
+var bit show_display, action_done
+
+; ========================= Functions and Procedures ==========================
+
+
+; Initialize and prepare the alarm volume. It is assumed that the audio is off.
+procedure prepare_alarm_volume() is
+
+   ; Preset volume for next run to get raw value and reset volume fade-in.
+   volume_set(volume_setting)
+   ; Get the current (raw) volume setting.
+   volume_fade_max = volume_get_raw()
+   ; Now it can be off.
+   volume_set(VOLUME_OFF)
+   volume_fade_in = VOLUME_OFF
+   volume_fade_in_timer = VOLUME_FADE_IN_TIME
+
+end procedure
+
+
+; Handle any active alarm. This procedure is called twice per second.
+procedure activate_alarms() is
+   
+   if alarm_1_active & (snooze_timer == 0) then
+      if initialize_alarm_volume then
+         prepare_alarm_volume()
+         initialize_alarm_volume = FALSE
+      end if 
+      ; Slowly increase the volume if not yet set at the user max.
+      if (volume_fade_in_timer != 0) then
+         volume_fade_in_timer = volume_fade_in_timer - 1
+      else
+         volume_fade_in_timer = VOLUME_FADE_IN_TIME
+         ; Now adjust the volume in small (raw) steps.
+         if (volume_fade_in < volume_fade_max) then
+            volume_up(volume_fade_in) 
+         end if 
+      end if
+      ; See which alarm must be activated.
+      if (alarm_setting_1 == ALARM_SETTING_RADIO) then
+         if !radio_is_on() then 
+            indicator_radio_1_blinking()
+            radio_set_frequency(radio_frequency)
+            radio_on()
+         end if 
+      elsif (alarm_setting_1 == ALARM_SETTING_BEEP) then
+         if !beep_is_on() then 
+            indicator_beep_1_blinking()
+            beep_on()
+         end if 
+      end if 
+      amplifier_on()
+   end if
+
+   if alarm_2_active & (snooze_timer == 0) then
+      if initialize_alarm_volume then
+         prepare_alarm_volume()
+         initialize_alarm_volume = FALSE
+      end if 
+      ; Slowly increase the volume if not yet set at the user max.
+      if (volume_fade_in_timer != 0) then
+         volume_fade_in_timer = volume_fade_in_timer - 1
+      else
+         volume_fade_in_timer = VOLUME_FADE_IN_TIME
+         ; Now adjust the volume in small (raw) steps.
+         if (volume_fade_in < volume_fade_max) then
+            volume_up(volume_fade_in) 
+         end if 
+      end if
+      ; See which alarm must be activated.
+      if (alarm_setting_2 == ALARM_SETTING_RADIO) then
+         if !radio_is_on() then 
+            indicator_radio_2_blinking()
+            radio_set_frequency(radio_frequency)
+            radio_on()
+         end if 
+      elsif (alarm_setting_2 == ALARM_SETTING_BEEP) then
+         if !beep_is_on() then 
+            indicator_beep_2_blinking()
+            beep_on()
+         end if 
+      end if 
+      amplifier_on()
+   end if 
+
+end procedure
+
+
+; Alarm routine check called twice per second. Check if an alarm was activated.
+; Note that the rtc alarm flag can be set even if we disabled the alarm.
+; We only trigger the alarm once.
+procedure check_alarms() is 
+
+   if rtc_alarm_1_flag & !alarm_1_active then
+      clear_rtc_alarm_1_flag()
+      if (alarm_setting_1 == ALARM_SETTING_RADIO) | 
+         (alarm_setting_1 == ALARM_SETTING_BEEP) then
+         ; Preset alarm volume for the alarm.
+         initialize_alarm_volume = TRUE
+         alarm_1_active = TRUE
+         snooze_timer = 0 ; This will activate the alarm.
+      end if 
+   end if
+
+   if rtc_alarm_2_flag & !alarm_2_active then
+      clear_rtc_alarm_2_flag()
+      if (alarm_setting_2 == ALARM_SETTING_RADIO)| 
+         (alarm_setting_2 == ALARM_SETTING_BEEP) then
+         ; Preset alarm volume for the alarm.
+         initialize_alarm_volume = TRUE
+         alarm_2_active = TRUE
+         snooze_timer = 0 ; This will activate the alarm.
+        end if 
+   end if
+
+end procedure
+
+
+; Switch all display indicators off.
+procedure display_indicators_off() is
+
+   indicator_seconds_off()
+   indicator_radio_1_off()
+   indicator_beep_1_off()
+   indicator_radio_2_off()
+   indicator_beep_2_off()
+   indicator_tens_off()
+   
+end procedure
+
+
+; Update the alarm indicators on the display. 
+procedure show_alarm_indicators() is
+
+   ; Update alarm 1 indicator.
+   if (alarm_setting_1 == ALARM_SETTING_RADIO) then
+      if alarm_1_active then
+         indicator_radio_1_blinking()
+      else
+         indicator_radio_1_on()
+      end if
+      indicator_beep_1_off()
+   elsif (alarm_setting_1 == ALARM_SETTING_BEEP) then
+      if alarm_1_active then
+         indicator_beep_1_blinking()
+      else
+         indicator_beep_1_on()
+      end if
+      indicator_radio_1_off()
+   else
+      indicator_radio_1_off()
+      indicator_beep_1_off()
+   end if 
+
+   ; Update alarm 2 indicator.
+   if (alarm_setting_2 == ALARM_SETTING_RADIO) then
+      if alarm_2_active then
+         indicator_radio_2_blinking()
+      else
+         indicator_radio_2_on()
+      end if 
+      indicator_beep_2_off()
+   elsif (alarm_setting_2 == ALARM_SETTING_BEEP) then
+      if alarm_2_active then
+         indicator_beep_2_blinking()
+      else
+         indicator_beep_2_on()
+      end if 
+      indicator_radio_2_off()
+   else
+      indicator_radio_2_off()
+      indicator_beep_2_off()
+   end if 
+
+end procedure
+
+
+; Update the status of the display with the current time
+procedure show_time() is
+
+   ; Update the display time.
+   rtc_get_time_bin(hours, minutes, seconds)
+   display_set_hours(hours)
+   display_set_minutes(minutes)
+   ; Whenever we show the time, the seconds indicator has to blink.
+   indicator_seconds_blinking()
+ 
+end procedure
+
+
+; Show the given frequency in kHz on the display in MHz. We use
+; The 3 left displays for the MHz and the most right display
+; for the tens. 
+procedure show_frequency(dword in frequency) is
+
+   var dword calculation
+   var byte high_part, low_part
+
+   ; Show the current selected frequency in MHz.
+   calculation = radio_frequency / 1000
+   high_part = byte(calculation)
+   ; Skip leading zero's in hours tens display.
+   if (high_part / 100) == 0 then
+      display_set_direct(DISPLAY_HOUR_TENS, SEGMENT_OFF)
+   else
+      display_set_direct(DISPLAY_HOUR_TENS, high_part / 100)
+   end if 
+   display_set_direct(DISPLAY_HOUR_UNITS, (high_part % 100) / 10)
+   display_set_direct(DISPLAY_MIN_TENS, high_part % 10)
+   calculation = (radio_frequency % 1000) / 100
+   low_part = byte(calculation)
+   display_set_direct(DISPLAY_MIN_UNITS, low_part)
+
+end procedure
+
+
+; Display the given channel on the minutes display and disable the hours.
+procedure show_channel(byte in channel) is
+
+   display_set_direct(DISPLAY_HOUR_TENS, SEGMENT_OFF)
+   display_set_direct(DISPLAY_HOUR_UNITS, SEGMENT_OFF)
+   ; Channel starts at 0 but for the user at 1.
+   if (channel == (MAX_RADIO_CHANNELS - 1)) then
+      display_set_direct(DISPLAY_MIN_TENS, 1)
+   else
+      ; No leading zero's.
+      display_set_direct(DISPLAY_MIN_TENS, SEGMENT_OFF)
+   end if
+   display_set_direct(DISPLAY_MIN_UNITS, (channel + 1) % 10)
+
+end procedure 
+
+
+; Display the given volume on the minutes display and disable the hours.
+; The volume is from MIN_VOLUME to MAX_VOLUME but the actual maximum
+; is X9C10X_MAX_VALUE.
+procedure show_volume(byte in volume) is
+
+   display_set_direct(DISPLAY_HOUR_TENS, SEGMENT_OFF)
+   display_set_direct(DISPLAY_HOUR_UNITS, SEGMENT_OFF)
+   if (volume >= 10) then
+      display_set_direct(DISPLAY_MIN_TENS, volume / 10)
+   else
+      ; No leading zero's.
+      display_set_direct(DISPLAY_MIN_TENS, SEGMENT_OFF)
+   end if 
+   display_set_direct(DISPLAY_MIN_UNITS, volume % 10)
+
+end procedure 
+
+
+; Display the given sleep time on the minutes display and disable the hours.
+procedure show_sleep_time(byte in sleep_time) is
+
+   display_set_direct(DISPLAY_HOUR_TENS, SEGMENT_OFF)
+   display_set_direct(DISPLAY_HOUR_UNITS, SEGMENT_OFF)
+   display_set_direct(DISPLAY_MIN_TENS, sleep_time / 10)
+   display_set_direct(DISPLAY_MIN_UNITS, sleep_time % 10)
+
+end procedure 
+
+
+; Display hyphen on all displays.
+procedure show_hyphen() is
+
+   display_set_direct(DISPLAY_HOUR_TENS, SEGMENT_HYPHEN)
+   display_set_direct(DISPLAY_HOUR_UNITS, SEGMENT_HYPHEN)
+   display_set_direct(DISPLAY_MIN_TENS, SEGMENT_HYPHEN)
+   display_set_direct(DISPLAY_MIN_UNITS, SEGMENT_HYPHEN)
+
+end procedure 
+
+
+; Increment the global variable hours and wrap to 0 if at max.
+procedure increment_hours() is
+
+   if (hours < 23) then
+      hours = hours + 1
+   else
+      hours = 0
+   end if 
+ 
+end procedure
+
+
+; Increment the given global variable minutes and wrap to 0 if at max.
+procedure increment_minutes() is
+
+   if (minutes < 59) then
+      minutes = minutes + 1
+   else
+      minutes = 0
+   end if 
+
+end procedure
+
+
+; ================================ Main Program ===============================
+; Initialize the used drivers.
+i2c_initialize()
+display_init()
+amplifier_init()
+rtc_init() ; This also initializes the IIC inteface.
+beep_init()
+radio_init() ; This driver also uses the IIC interface.
+
+; Set the correct alarm rates. We are only interested in
+; hours and minutes. Seconds are at 0.
+rtc_set_alarm_1_rate(RTC_ALARM_1_HOUR_MIN_SEC_MATCH)
+rtc_set_alarm_2_rate(RTC_ALARM_2_HOUR_MIN_MATCH)
+
+; Get all previous clock settings from the EEPROM and initialize if not initialized.
+if (data_eeprom(EEPROM_ADDRESS_INIT) == EEPROM_EMPTY) then
+   ; Not yet initialized, store default values.
+   data_eeprom_write(EEPROM_ADDRESS_INIT,!EEPROM_EMPTY)
+   data_eeprom_write(EEPROM_ADDRESS_ALARM_1, ALARM_SETTING_OFF)
+   data_eeprom_write(EEPROM_ADDRESS_ALARM_2, ALARM_SETTING_OFF)
+   data_eeprom_write(EEPROM_ADDRESS_BRIGHTNESS, DISPLAY_BRIGHTNESS_MAX)
+   data_eeprom_write(EEPROM_ADDRESS_VOLUME, VOLUME_MIN)
+   data_eeprom_write(EEPROM_ADDRESS_CHANNEL, MIN_RADIO_CHANNELS)
+   ; Initialize the 10 channel presets to an initial value.
+   for MAX_RADIO_CHANNELS using index loop  
+      data_eeprom_write_dword(EEPROM_ADDRESS_FREQUENCY + 
+                             (index * EEPROM_FREQUENCY_ADDRESS_SIZE), 
+                              RADIO_INITIAL_PRESET)
+   end loop
+end if 
+
+; Get the stored settings.
+alarm_setting_1 = data_eeprom(EEPROM_ADDRESS_ALARM_1)
+alarm_setting_2 = data_eeprom(EEPROM_ADDRESS_ALARM_2)
+brightness_setting = data_eeprom(EEPROM_ADDRESS_BRIGHTNESS)
+volume_setting = data_eeprom(EEPROM_ADDRESS_VOLUME)
+radio_channel = data_eeprom(EEPROM_ADDRESS_CHANNEL)
+radio_frequency = data_eeprom_dword(EEPROM_ADDRESS_FREQUENCY + 
+                                   (radio_channel * EEPROM_FREQUENCY_ADDRESS_SIZE))
+
+; Update the clock with these settings.
+show_time()
+show_alarm_indicators()
+volume_set(volume_setting)
+display_set_brightness(brightness_setting)
+
+; Set the display, if it is off, show it shortly on.
+if !display_is_on() then
+   display_set_brightness(DISPLAY_BRIGHTNESS_MIN)  
+   delay_1s(2)
+   ; Restore initial setting (which was off)
+   display_set_brightness(brightness_setting)
+end if 
+
+; Initialize some global variables. 
+alarm_1_active = FALSE
+alarm_2_active = FALSE
+initialize_alarm_volume = FALSE
+sleep_timer = 0
+snooze_timer = 0
+display_hold_timer = 0
+clock_state = CLOCK_STATE_RUNNING
+
+; Main program starts here.
+forever loop 
+
+   ; The Alarm clock is based on a state machine.
+   case clock_state of
+
+      CLOCK_STATE_RUNNING:
+      block
+         ; --- Start with some general stuff based on a half a second timer ---
+
+         ; Update the display and handle the alarms every second.
+         if display_half_a_second_passed() then
+
+            ; Check if we need to freeze the display. If not, update the time
+            ; and the indicators.
+            if (display_hold_timer == 0) then
+               show_time()
+               ; It might be that the brightness was temporary changed. If so
+               ; restore is.
+               if (display_get_brightness() != brightness_setting) then
+                   display_set_brightness(brightness_setting)
+               end if
+            else
+               ; No display update during hold time.
+               display_hold_timer = display_hold_timer - 1
+            end if 
+
+            ; Check the alarms, if set.
+            check_alarms()
+            ; And activate.
+            activate_alarms() 
+
+            ; Decrement the snooze time (if set). This will trigger the alarm (again).
+            if (alarm_1_active | alarm_2_active) & (snooze_timer != 0) then
+               snooze_timer = snooze_timer - 1
+            end if 
+
+            ; Check the sleep timer.
+            if (sleep_timer != 0) then
+               sleep_timer = sleep_timer - 1 
+               if (sleep_timer == 0) then
+                  radio_off()
+                  indicator_tens_off()
+                  amplifier_off()
+               end if 
+            end if 
+
+         end if ; Half a second passed.
+
+         ; ---------------- Now check all keys of the keyboard ----------------
+
+         ; We need to remember if a key was pressed since we use that to show the display 
+         ; for some time if it was turned off.
+         show_display = FALSE
+
+         ; Check for setting the time using the 'Hour' key.
+         if key_pressed(KEYBOARD_KEY_HOUR_TUNE_PLUS) then
+            show_display = TRUE
+            if key_pressed_long(KEYBOARD_KEY_HOUR_TUNE_PLUS) then
+               clock_state = CLOCK_STATE_SET_TIME
+            end if 
+         end if
+
+         ; Check for setting the time using the 'Minute' key.
+         if key_pressed(KEYBOARD_KEY_MINUTE_TUNE_MINUS) then
+            show_display = TRUE
+            if key_pressed_long(KEYBOARD_KEY_MINUTE_TUNE_MINUS) then
+               clock_state = CLOCK_STATE_SET_TIME
+            end if 
+         end if
+
+         ; Check for setting the alarm time 1. This is activated by pressing
+         ; the alarm 1 key for a longer time. 
+         if key_pressed(KEYBOARD_KEY_ALARM_1_VOL_MINUS) then
+            show_display = TRUE
+            ; This has a double function check for volume.
+            if radio_is_on() | beep_is_on() then
+               indicator_seconds_off()
+               volume_step_down(volume_setting)
+               show_volume(volume_setting)
+               display_hold_timer = DISPLAY_HOLD_TIME
+               data_eeprom_write(EEPROM_ADDRESS_VOLUME, volume_setting)
+               wait_for_key_release()
+            else
+               ; Handle it as an alarm function.
+               if key_pressed_long(KEYBOARD_KEY_ALARM_1_VOL_MINUS) then
+                  clock_state = CLOCK_STATE_SET_ALARM_TIME_1
+                  ; Reset any pending alarm from the RTC.
+                  clear_rtc_alarm_1_flag()
+                  alarm_1_active =  FALSE
+               else
+                  ; It was a short key press, toggle the alarm setting.
+                  if (alarm_setting_1 == ALARM_SETTING_OFF) then
+                     alarm_setting_1 = ALARM_SETTING_RADIO
+                  elsif (alarm_setting_1 == ALARM_SETTING_RADIO) then
+                     alarm_setting_1 = ALARM_SETTING_BEEP
+                  else
+                     alarm_setting_1 = ALARM_SETTING_OFF
+                  end if
+                  ; Reset any pending alarm from the RTC.
+                  clear_rtc_alarm_1_flag()
+                  alarm_1_active =  FALSE
+                  ; Alarm indicators must be updated.
+                  show_alarm_indicators()
+                  if (alarm_setting_1 != ALARM_SETTING_OFF) then
+                     ; Show the current set alarm time for a few seconds.
+                     rtc_get_alarm_1_time_bin(hours, minutes, seconds)
+                     display_set_hours(hours)
+                     display_set_minutes(minutes)
+                     indicator_seconds_on() 
+                     display_hold_timer = DISPLAY_HOLD_TIME
+                  end if 
+                  ; Store the new alarm setting.
+                  data_eeprom_write(EEPROM_ADDRESS_ALARM_1, alarm_setting_1)
+                  wait_for_key_release()
+               end if
+               ; Make sure that the alarm volume is set since it can be
+               ; affected by the slow increase in alarm volume.
+               volume_set(volume_setting)
+            end if   
+         end if
+
+         ; Check for seting the alarm time 2. This is activated by pressing
+         ; the alarm 2 key for a longer time. 
+         if key_pressed(KEYBOARD_KEY_ALARM_2_VOL_PLUS) then
+            show_display = TRUE
+            ; This has a double function check for volume.
+            if radio_is_on() | beep_is_on() then
+               indicator_seconds_off() 
+               volume_step_up(volume_setting)
+               show_volume(volume_setting)
+               display_hold_timer = DISPLAY_HOLD_TIME
+               data_eeprom_write(EEPROM_ADDRESS_VOLUME, volume_setting)
+               wait_for_key_release()
+            else
+               ; Handle it as an alarm function.
+               if key_pressed_long(KEYBOARD_KEY_ALARM_2_VOL_PLUS) then
+                  clock_state = CLOCK_STATE_SET_ALARM_TIME_2
+                  ; Reset any pending alarm from the RTC.
+                  clear_rtc_alarm_2_flag()
+                  alarm_2_active =  FALSE
+               else
+                  ; It was a short key press, toggle the alarm setting.
+                  if (alarm_setting_2 == ALARM_SETTING_OFF) then
+                     alarm_setting_2 = ALARM_SETTING_RADIO
+                  elsif (alarm_setting_2 == ALARM_SETTING_RADIO) then
+                     alarm_setting_2 = ALARM_SETTING_BEEP
+                  else
+                     alarm_setting_2 = ALARM_SETTING_OFF
+                  end if
+                  ; Reset any pending alarm from the RTC.
+                  clear_rtc_alarm_2_flag()
+                  alarm_2_active =  FALSE
+                  ; Alarm indicators must be updated.
+                  show_alarm_indicators()
+                  if (alarm_setting_2 != ALARM_SETTING_OFF) then
+                     ; Show the current set alarm time for a few seconds.
+                     rtc_get_alarm_2_time_bin(hours, minutes)
+                     display_set_hours(hours)
+                     display_set_minutes(minutes)
+                     indicator_seconds_on() 
+                     display_hold_timer = DISPLAY_HOLD_TIME
+                  end if 
+                  ; Store the new alarm setting.
+                  data_eeprom_write(EEPROM_ADDRESS_ALARM_2, alarm_setting_2)
+                  wait_for_key_release()
+               end if 
+               ; Make sure that the alarm volume is set since it can be
+               ; affected by the slow increase in alarm volume.
+               volume_set(volume_setting)
+            end if  
+         end if
+
+         ; Check for Snooze, in case of alarm.
+         if key_pressed(KEYBOARD_KEY_SNOOZE) then
+            show_display = TRUE
+            if alarm_1_active | alarm_2_active then
+               ; Stop all alarm sounds.
+               beep_off()
+               radio_off()
+               indicator_tens_off()
+               amplifier_off()
+               ; Preset alarm volume for the next run.
+               initialize_alarm_volume = TRUE
+               ; Set the snooze timer.
+               snooze_timer = SNOOZE_TIME
+               ; Prevent that the sleep timer is switching stuff off.
+               sleep_timer = 0
+            else
+               ; Only activate the snooze feature when the display is on
+               ; otherwise we skip that and turn the display on for a short
+               ; time and show the current time.
+               if display_is_on() then
+                  ; Snooze without alarm means turn on the radio for some time.
+                  ; Set the sleep timer for the radio to be on. We show the 
+                  ; set time on the minutes display. This can only be set
+                  ; when the display is on.
+                  indicator_seconds_off() 
+                  if (sleep_timer == 0) then
+                     sleep_timer = SLEEP_TIME_15
+                     show_sleep_time(15)
+                  elsif (sleep_timer <= SLEEP_TIME_15) then
+                     sleep_timer = SLEEP_TIME_30
+                     show_sleep_time(30)
+                  elsif (sleep_timer <= SLEEP_TIME_30) then
+                     sleep_timer = SLEEP_TIME_60
+                     show_sleep_time(60)
+                  elsif (sleep_timer <= SLEEP_TIME_60) then
+                     sleep_timer = SLEEP_TIME_90
+                     show_sleep_time(90)
+                  else 
+                     ; Show the text 'OFF'.
+                     display_set_direct(DISPLAY_HOUR_TENS, SEGMENT_OFF)
+                     display_set_direct(DISPLAY_HOUR_UNITS, 0x00)
+                     display_set_direct(DISPLAY_MIN_TENS, 0x0F)
+                     display_set_direct(DISPLAY_MIN_UNITS, 0x0F)
+                     sleep_timer = 0
+                     radio_off()
+                     indicator_tens_off()
+                     amplifier_off()
+                  end if 
+                  ; Now see if the radio must be on or off.
+                  if (sleep_timer != 0) then
+                     ; Normal sleep timer.
+                     radio_set_frequency(radio_frequency)
+                     radio_on()
+                     amplifier_on()
+                     ; Show on the display that the radio is on.
+                     indicator_tens_on()
+                  end if
+                  ; Show the sleep time for some time. After that the time
+                  ; and the indicators will be updated. The latter only once.
+                  display_hold_timer = DISPLAY_HOLD_TIME
+               end if 
+            end if 
+            wait_for_key_release()
+            show_display = TRUE
+         end if
+
+         ; Check for the radio feature.
+         if key_pressed(KEYBOARD_KEY_RADIO) then
+            show_display = TRUE
+            if key_pressed_long(KEYBOARD_KEY_RADIO) then
+               clock_state = CLOCK_STATE_SET_RADIO
+            else
+               ; Short keypress, toggle radio on or off.
+               if radio_is_on() then
+                  radio_off()
+                  amplifier_off()
+                  indicator_tens_off()
+               else
+                  radio_set_frequency(radio_frequency)
+                  radio_on()
+                  ; Volume can be lower if alarm was snoozed so set it again.
+                  volume_set(volume_setting)
+                  amplifier_on()
+                  ; Show on the display that the radio is on.
+                  indicator_tens_on()
+               end if
+               wait_for_key_release()
+            end if 
+         end if 
+
+         ; Check for preset. This does multiple things depending on what
+         ; is going on.
+         if key_pressed(KEYBOARD_KEY_PRESET) then
+            show_display = TRUE
+            ; This key always clears any active alarm.
+            if alarm_1_active | alarm_2_active then
+               alarm_1_active = FALSE
+               alarm_2_active = FALSE
+               snooze_timer = 0
+               ; Stop all blinking of the alarm indicators
+               show_alarm_indicators()
+               ; Switch all audio off.
+               radio_off()
+               indicator_tens_off()
+               beep_off()
+               amplifier_off()
+               ; Restore the volume setting.
+               volume_set(volume_setting)
+               ; Clear the alarms of the RTC.
+               clear_rtc_alarm_1_flag()
+               clear_rtc_alarm_2_flag()
+               wait_for_key_release()           
+            else
+               ; Short key press. If the radio is on we go to the next channel.
+               if radio_is_on() then
+                  indicator_seconds_off() 
+                  ; Next channel.
+                  radio_channel = radio_channel + 1
+                  if (radio_channel >= MAX_RADIO_CHANNELS) then
+                     ; We start again with the first channel.
+                     radio_channel = MIN_RADIO_CHANNELS
+                  end if
+                  data_eeprom_write(EEPROM_ADDRESS_CHANNEL, radio_channel)
+                  ; Get the radio station for this preset.
+                  radio_frequency = data_eeprom_dword(EEPROM_ADDRESS_FREQUENCY + 
+                                    (radio_channel * EEPROM_FREQUENCY_ADDRESS_SIZE))
+                  radio_set_frequency(radio_frequency)
+                  ; Show the channel number for some time.
+                  show_channel(radio_channel)
+                  display_hold_timer = DISPLAY_HOLD_TIME
+                  wait_for_key_release()
+               end if 
+            end if 
+         end if 
+
+         ; Check for brightness. Here we will not use short_key_press since we
+         ; change the brightness to the value we want (inclusing display off).
+         if key_pressed(KEYBOARD_KEY_BRIGHTNESS) then
+            ; For this setting we do not need to show the display for some time.
+            show_display = FALSE
+            ; The brightness goes from MAX to MIN to OFF.
+            display_decrease_brightness()
+            brightness_setting = display_get_brightness()
+            ; Display can go from off to on.
+            if display_is_on() then
+               show_time()
+               show_alarm_indicators()
+            end if 
+            ; Store this setting.
+            data_eeprom_write(EEPROM_ADDRESS_BRIGHTNESS, brightness_setting)
+            wait_for_key_release()
+         end if
+
+         ; Now see if we need to turn on the display for a short time.
+         if show_display & !display_is_on() & then
+            show_display = FALSE
+            display_set_brightness(DISPLAY_BRIGHTNESS_MIN)
+            display_hold_timer = DISPLAY_HOLD_TIME
+         end if 
+
+      end block ; CLOCK_STATE_RUNNING
+
+      CLOCK_STATE_SET_TIME:
+      block
+         ; Display must be on.
+         display_set_brightness(DISPLAY_BRIGHTNESS_MAX)
+         ; Get the time ands how it.
+         show_time()
+         ; Set seconds indicator to stable since display will blink.
+         indicator_seconds_on()
+         display_blink()
+         wait_for_key_release()
+         ; Stay in this cycle until the preset key is pressed.
+         while (clock_state == CLOCK_STATE_SET_TIME) loop
+            ; Now check which key is used to set the time.
+            if key_pressed(KEYBOARD_KEY_HOUR_TUNE_PLUS) then
+               increment_hours()
+               display_set_hours(hours)
+               wait_for_key_release()
+            elsif key_pressed(KEYBOARD_KEY_MINUTE_TUNE_MINUS) then
+               increment_minutes()
+               display_set_minutes(minutes)
+               wait_for_key_release()
+            elsif key_pressed(KEYBOARD_KEY_PRESET) then
+               ; We are done with the setting the time.
+               display_steady()
+               rtc_set_time_bin(hours, minutes, 0)
+               ; Show the time.
+               show_time()
+               wait_for_key_release()
+               clock_state = CLOCK_STATE_RUNNING
+            end if 
+         end loop
+         ; Keep the current display value for some time.
+         display_hold_timer = DISPLAY_HOLD_TIME
+      end block ; CLOCK_STATE_SET_TIME:
+
+      CLOCK_STATE_SET_ALARM_TIME_1:
+      block
+         ; Display must be on.
+         display_set_brightness(DISPLAY_BRIGHTNESS_MAX)
+         ; Set the the alarm time. First get it.
+         rtc_get_alarm_1_time_bin(hours, minutes, seconds)
+         display_set_hours(hours)
+         display_set_minutes(minutes)
+         ; Alarm time is for radio and beep, indicate.
+         indicator_radio_1_blinking()
+         indicator_beep_1_blinking()
+         indicator_seconds_on()
+         display_blink()
+         wait_for_key_release()
+         while (clock_state == CLOCK_STATE_SET_ALARM_TIME_1) loop
+            ; Now check which key is used to set the alarm.
+            if key_pressed(KEYBOARD_KEY_HOUR_TUNE_PLUS) then
+               increment_hours()
+               display_set_hours(hours)
+               wait_for_key_release()
+            elsif key_pressed(KEYBOARD_KEY_MINUTE_TUNE_MINUS) then
+               increment_minutes()
+               display_set_minutes(minutes)
+               wait_for_key_release()
+            elsif key_pressed(KEYBOARD_KEY_PRESET) then
+               ; We are done with the setiing the alarm time.
+               rtc_set_alarm_1_time_bin(hours, minutes, seconds)
+               display_steady()
+               show_alarm_indicators() ; Time will be displayed after the hold time.
+               wait_for_key_release()
+               clock_state = CLOCK_STATE_RUNNING
+            end if 
+         end loop
+         ; Keep the current display value for some time.
+         display_hold_timer = DISPLAY_HOLD_TIME
+      end block ; CLOCK_STATE_SET_ALARM_TIME_1
+    
+      CLOCK_STATE_SET_ALARM_TIME_2:
+      block
+         ; Display must be on.
+         display_set_brightness(DISPLAY_BRIGHTNESS_MAX)
+          ; Set the the alarm time. First get it.
+         rtc_get_alarm_2_time_bin(hours, minutes)
+         display_set_hours(hours)
+         display_set_minutes(minutes)
+         ; Alarm time is for radio and beep, indicate.
+         indicator_radio_2_blinking()
+         indicator_beep_2_blinking()
+         indicator_seconds_on()
+         display_blink()
+         wait_for_key_release()
+         ; Stay in this cycle until the preset key is pressed.
+         while (clock_state == CLOCK_STATE_SET_ALARM_TIME_2) loop
+            ; Now check which key is used to set the alarm.
+            if key_pressed(KEYBOARD_KEY_HOUR_TUNE_PLUS) then
+               increment_hours()
+               display_set_hours(hours)
+               wait_for_key_release()
+            elsif key_pressed(KEYBOARD_KEY_MINUTE_TUNE_MINUS) then
+               increment_minutes()
+               display_set_minutes(minutes)
+               wait_for_key_release()
+            elsif key_pressed(KEYBOARD_KEY_PRESET) then
+               ; We are done with the settiing the alarm time.
+               rtc_set_alarm_2_time_bin(hours, minutes)
+               display_steady()
+               show_alarm_indicators() ; Time will be displayed after the hold time.
+               wait_for_key_release()
+               clock_state = CLOCK_STATE_RUNNING
+            end if 
+         end loop
+         ; Keep the current display value for some time.
+         display_hold_timer = DISPLAY_HOLD_TIME
+      end block ; CLOCK_STATE_SET_ALARM_TIME_2
+    
+      ; Switch the radio on and handle all radio on functions.
+      CLOCK_STATE_SET_RADIO:
+      block
+         ; Display must be on.
+         display_set_brightness(DISPLAY_BRIGHTNESS_MAX)
+         ; The radio is on. Handle all radio functions.
+         radio_set_frequency(radio_frequency)
+         show_frequency(radio_frequency)
+         display_indicators_off()
+         indicator_tens_on()
+         radio_on()
+         volume_set(volume_setting)
+         amplifier_on()
+         display_hold_timer = 0
+         display_blink() ; This will also blink the tens indicator.
+         wait_for_key_release()
+         ; Stay in this cycle until the radio key is pressed again.
+         while (clock_state == CLOCK_STATE_SET_RADIO) loop
+            ; We loop once every 10 ms because we need to hold the display
+            ; some time. 
+            delay_1ms(10)
+            if (display_hold_timer == 0) then
+               show_frequency(radio_frequency)
+            else
+               ; No display update during hold time.
+               display_hold_timer = display_hold_timer - 1
+            end if 
+            if key_pressed(KEYBOARD_KEY_RADIO) then
+               ; Switch the radio off and return to running mode.
+               radio_off()
+               amplifier_off()
+               indicator_tens_off()
+               display_hold_timer = 0
+               display_steady()
+               show_time()
+               clock_state = CLOCK_STATE_RUNNING
+               wait_for_key_release()
+           elsif key_pressed(KEYBOARD_KEY_HOUR_TUNE_PLUS) then
+               ; Tune to next channel, indicate by showing a hypen.
+               show_hyphen()
+               radio_frequency = radio_tune_to_next_channel()
+               ; Show the frequency of the found radio station.
+               show_frequency(radio_frequency)
+               wait_for_key_release()
+            elsif key_pressed(KEYBOARD_KEY_MINUTE_TUNE_MINUS) then
+               ; Tune to next channel, indicate by showing a hypen.
+               show_hyphen()
+               radio_frequency = radio_tune_to_previous_channel()
+               ; Show the frequency of the found radio station.
+               show_frequency(radio_frequency)
+               wait_for_key_release()
+            elsif key_pressed_long(KEYBOARD_KEY_PRESET) then
+               ; Store this frequency on a preset number.
+               show_channel(radio_channel)
+               wait_for_key_release()
+               ; Now see what the user wants.
+               action_done = FALSE
+               while !action_done loop
+                  if key_pressed(KEYBOARD_KEY_HOUR_TUNE_PLUS) then
+                     ; Next channel number.
+                     radio_channel = radio_channel + 1
+                     if (radio_channel >= MAX_RADIO_CHANNELS) then
+                        ; We start again with the first channel.
+                        radio_channel = MIN_RADIO_CHANNELS
+                     end if
+                     show_channel(radio_channel)
+                     wait_for_key_release()
+                  elsif key_pressed(KEYBOARD_KEY_MINUTE_TUNE_MINUS) then
+                     ; Previous channel number.
+                     if (radio_channel == MIN_RADIO_CHANNELS) then
+                        radio_channel = MAX_RADIO_CHANNELS
+                     end if
+                     radio_channel = radio_channel - 1
+                     show_channel(radio_channel)
+                     wait_for_key_release()
+                  elsif key_pressed(KEYBOARD_KEY_PRESET) then
+                     ; Store this channel and the frequency of this channel.
+                     data_eeprom_write(EEPROM_ADDRESS_CHANNEL, radio_channel)
+                     data_eeprom_write_dword(EEPROM_ADDRESS_FREQUENCY + 
+                                            (radio_channel * EEPROM_FREQUENCY_ADDRESS_SIZE), 
+                                            radio_frequency)
+                     action_done = TRUE
+                     wait_for_key_release()
+                  end if 
+               end loop
+            elsif key_pressed(KEYBOARD_KEY_ALARM_2_VOL_PLUS) then
+               ; Volume up.
+               volume_step_up(volume_setting)
+               show_volume(volume_setting)
+               data_eeprom_write(EEPROM_ADDRESS_VOLUME, volume_setting)
+               display_hold_timer = 200 
+               wait_for_key_release()
+            elsif key_pressed(KEYBOARD_KEY_ALARM_1_VOL_MINUS) then
+               ; Volume down.
+               volume_step_down(volume_setting)
+               show_volume(volume_setting)
+               data_eeprom_write(EEPROM_ADDRESS_VOLUME, volume_setting)
+               display_hold_timer = 200 
+               wait_for_key_release()
+           end if 
+         end loop
+         ; Keep the current display value for some time.
+         display_hold_timer = DISPLAY_HOLD_TIME
+      end block ; CLOCK_STATE_SET_RADIO
+
+   end case
+   
+end loop

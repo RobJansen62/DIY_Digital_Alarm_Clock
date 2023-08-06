@@ -1,0 +1,705 @@
+;===============================================================================
+; Title: LED display driver for the digital alarm clock.
+;
+; Author: Rob Jansen, Copyright (c) 2023..2023, all rights reserved.
+;
+; Revisions
+; ---------
+; 2023-02-11 : Initial version
+; 2023-06-23 : Changed from active low segment (common anode display) to active
+;              high segment (common cathode display).
+; 2023-06-25 : Added pause in the display multiplexing to prevent 'ghost' numbers.
+; 2023-07-13 : Synchronized indicator blinking with display blinking.
+;
+; Compiler: jalv25r7
+;
+; Description: This module drives the 7-segment LED display and provides 
+;              functions for writing data to the display and the indicators
+;              on the display. The four 7-segment displays and the indicators
+;              are multiplexed. A brightness feature for the display is also
+;              provided.
+;
+; Sources: -
+;
+; ================== Constant and variable declarations =======================
+
+; The 7-segment displays are connected to PORTD. Segements are active high. The
+; segments are connected as follows:
+; -) d0 = segment a
+; -) d1 = segment b
+; -) d2 = segment c
+; -) d3 = segment d
+; -) d4 = segment e
+; -) d5 = segment f
+; -) d6 = segment g
+alias _segment_display is portd
+portd_direction = ALL_OUTPUT
+
+; Remaining indicators on the display are connected to PORTA. Indicators are
+; active high. The indicators are connected as follows:
+; -) a0 = seconds
+; -) a1 = radio alarm 1
+; -) a2 = beep alarm 1
+; -) a3 = radio alarm 2
+; -) a4 = beep alarm 2
+; -) a5 = tens
+alias _indicator_display is porta
+porta_direction = 0b1100_0000 ; Only make these 6 pins output.
+
+; The scanlines for the 7-segment displays are active high.
+const bit SCANLINE_OFF = LOW
+const bit SCANLINE_ON  = HIGH
+; Indicators are controlled in a different way.
+const byte INDICATOR_OFF = 0x00
+
+; Control pin connections for the the display. These are active high and must
+; be set low before making them output.
+alias _display_hour_10 is pin_e0
+_display_hour_10  = SCANLINE_OFF
+pin_e0_direction = OUTPUT
+alias _display_hour_1 is pin_e1
+_display_hour_1   = SCANLINE_OFF
+pin_e1_direction = OUTPUT
+alias _display_min_10 is pin_c0
+_display_min_10   = SCANLINE_OFF
+pin_c0_direction = OUTPUT
+alias _display_min_1 is pin_c1
+_display_min_1    = SCANLINE_OFF
+pin_c1_direction = OUTPUT
+
+; Conversion table to translate a byte to 7-segment display. The segments
+; are activated by an active high signal, assigned as follows to a byte:
+; msb to lsb = gfe dcba where the msb is not used.
+const byte DISPLAY_OPTIONS = 18
+const byte DIGIT_TO_7_SEGMENT[DISPLAY_OPTIONS] = {
+   0b_0011_1111, ; 0 = fedcba
+   0b_0000_0110, ; 1 = cb
+   0b_0101_1011, ; 2 = gedba
+   0b_0100_1111, ; 3 = gdcba
+   0b_0110_0110, ; 4 = gfcb
+   0b_0110_1101, ; 5 = gfdca
+   0b_0111_1101, ; 6 = gfedca
+   0b_0000_0111, ; 7 = cba
+   0b_0111_1111, ; 8 = gfedcba
+   0b_0110_1111, ; 9 = gfdcba
+   0b_0111_0111, ; A = gfecba
+   0b_0111_1100, ; b = gfedc
+   0b_0011_1001, ; C = feda
+   0b_0101_1110, ; d = gedcb
+   0b_0111_1001, ; E = gfeda
+   0b_0111_0001, ; F = gfea
+   0b_0100_0000, ; - = g, hypen used to indicate no display value.
+   0b_0000_0000  ;   = off
+}
+
+; Extra constants for special display values.
+const byte SEGMENT_OFF    = DISPLAY_OPTIONS - 1
+const byte SEGMENT_HYPHEN = DISPLAY_OPTIONS - 2
+
+; Display numbers.
+const byte DISPLAY_MIN_UNITS  = 0 
+const byte DISPLAY_MIN_TENS   = 1
+const byte DISPLAY_HOUR_UNITS = 2
+const byte DISPLAY_HOUR_TENS  = 3
+
+; Indicator masks. Note: Indicators are active high.
+const byte INDICATOR_SECONDS = 0b0000_0001
+const byte INDICATOR_RADIO_1 = 0b0000_0010
+const byte INDICATOR_BEEP_1  = 0b0000_0100
+const byte INDICATOR_RADIO_2 = 0b0000_1000
+const byte INDICATOR_BEEP_2  = 0b0001_0000
+const byte INDICATOR_TENS    = 0b0010_0000
+
+; Display multiplexer states.
+const byte DISPLAY_MUX_HOUR_TENS   = 0
+const byte DISPLAY_MUX_HOUR_UNITS  = 1
+const byte DISPLAY_MUX_MIN_TENS    = 2
+const byte DISPLAY_MUX_MIN_UNITS   = 3
+const byte DISPLAY_MUX_BRIGHTNESS  = 4
+const byte DISPLAY_MUX_PAUSE       = 5
+
+; Brightness settings.  
+const byte DISPLAY_BRIGHTNESS_MIN  = 0  ; Minimum brightness.
+const byte DISPLAY_BRIGHTNESS_MAX  = 3  ; Maximum brightness.
+const byte DISPLAY_BRIGHTNESS_OFF  = 4  ; Display off.
+
+; For dimming (lower brightness) we need a larger value than DISPLAY_BRIGHTNESS_MAX 
+; to make a difference on the display so we multiply this by DISPLAY_DIMMING_STEP. 
+; Note that the multiplexer has to run DISPLAY_DIMMING_MAX times faster then.
+const byte DISPLAY_DIMMING_MIN  = 0  ; Minimum dimming is maximum brightness.
+const byte DISPLAY_DIMMING_MAX  = 30 ; Maximum dimming is minimum brightness.
+const byte DISPLAY_DIMMING_OFF  = 31 ; Display Off.
+const byte DISPLAY_DIMMING_STEP = DISPLAY_DIMMING_MAX /  DISPLAY_BRIGHTNESS_MAX
+
+; Display blink time based on 1/5681. Blink time is half a second.
+const word DISPLAY_BLINK_TIME = 4_310 ; 4310 * (1 / 8620 ) = 0,5 sec.
+
+; Local variables.
+var word _display_blink_counter
+var byte _display_hour_tens    
+var byte _display_hour_units   
+var byte _display_min_tens     
+var byte _display_min_units    
+var byte _display_mux_state, _display_next_mux_state    
+var byte _display_indicator    
+var byte _display_dimming_counter, _display_dimming_set 
+var byte _backup_hour_tens, _backup_hour_units
+var byte _backup_min_tens, _backup_min_units
+var byte _backup_indicator
+var bit _display_control  ; If HIGH the display is activated.
+var bit _backup_control
+var bit _display_is_on
+var bit _display_blinking, _indicator_seconds_blinking, _sync_blink
+var bit _indicator_radio_1_blinking, _indicator_beep_1_blinking
+var bit _indicator_radio_2_blinking, _indicator_beep_2_blinking
+var bit _indicator_tens_blinking
+var bit _half_a_second_passed
+
+; ========================= Functions and Procedures ==========================
+
+; Initialize the display and start the display multiplexing using timer 0.
+procedure display_init() is
+
+   ; Initialize the display to '-'
+   _display_hour_tens = DIGIT_TO_7_SEGMENT[SEGMENT_HYPHEN]
+   _display_hour_units = DIGIT_TO_7_SEGMENT[SEGMENT_HYPHEN]
+   _display_min_tens = DIGIT_TO_7_SEGMENT[SEGMENT_HYPHEN]
+   _display_min_units = DIGIT_TO_7_SEGMENT[SEGMENT_HYPHEN]
+   _display_indicator = INDICATOR_OFF
+   _backup_indicator = _display_indicator
+   _display_control = SCANLINE_ON
+   _backup_control = _display_control
+   _display_blink_counter = DISPLAY_BLINK_TIME
+   ; Set brightness to maximum, this means minimal dimming.
+   _display_dimming_set = DISPLAY_DIMMING_MIN
+   _display_dimming_counter = _display_dimming_set
+   _half_a_second_passed = FALSE
+
+   ; Nothing is blinking.
+   _display_blinking = FALSE
+   _indicator_seconds_blinking = TRUE
+   _indicator_radio_1_blinking = FALSE
+   _indicator_beep_1_blinking = FALSE
+   _indicator_radio_2_blinking = FALSE
+   _indicator_beep_2_blinking = FALSE
+   _indicator_tens_blinking = FALSE
+   _sync_blink = FALSE
+   _display_is_on = TRUE
+
+   ; Start mutiplexing the display with the tens of hours.
+   _display_mux_state = DISPLAY_MUX_HOUR_TENS
+   
+   ; The four display will be multiplexed. If we choose a frequency for one
+   ; display to be 70 Hz, we need a at least a frequency of 280 Hz for all four 
+   ; displays. Because of the dim feature we can have a pause of 30 so we need
+   ; to run the display at 30 times the frequency so 30 * 280 = 8400 Hz.
+   ; We use timer 0 in 8 bit mode so it auto reloads.
+   T0CON0_EN = FALSE    ; Disable timer 0.
+   T0CON0_MD16 = FALSE  ; Use 8 bit mode.
+   T0CON1_CS = 0b010    ; Clock source is Fosc/4 = 2 MHz.
+   T0CON1_CKPS = 0b0011 ; Prescaler 8 gives 250.000 Hz.
+   TMR0H = 29           ; 250.000 / 29 = 8620 Hz.
+   TMR0L = 0            ; Reset timer 0 counter.
+   ; Now enable all interrupts.
+   PIE0_TMR0IE = TRUE  ; Enable timer 0 interrupts. 
+   INTCON_PEIE = TRUE  ; Enable peripheral interrupts.
+   INTCON_GIE  = TRUE  ; Enable the global interrupt.
+   T0CON0_EN   = TRUE  ; Enable timer 0.
+
+end procedure
+
+
+
+; Return TRUE if the display is currently on.
+function display_is_on() return bit is
+
+   return (_display_dimming_set != DISPLAY_DIMMING_OFF)
+
+end function
+
+
+; Blink the display.
+procedure display_blink() is
+   
+   if !_display_blinking then
+      _backup_control = _display_control
+      _display_blinking = TRUE
+   end if 
+
+end procedure
+
+
+; Set the display to a steady state.
+procedure display_steady() is
+   
+   if _display_blinking then
+      _display_blinking = FALSE
+      _display_control = _backup_control
+   end if 
+
+end procedure
+
+
+; Switch the seconds indicator on and stop any blinking. 
+procedure indicator_seconds_on() is
+
+   _indicator_seconds_blinking = FALSE
+   _display_indicator = _display_indicator | INDICATOR_SECONDS
+   _backup_indicator = _display_indicator
+
+end procedure
+
+
+; Switch the seconds indicator off and stop any blinking..
+procedure indicator_seconds_off() is
+
+   _indicator_seconds_blinking = FALSE
+   _display_indicator = _display_indicator & !INDICATOR_SECONDS
+   _backup_indicator = _display_indicator
+
+end procedure
+
+
+; Switch the seconds indicator to blink mode.
+procedure indicator_seconds_blinking() is
+
+   _indicator_seconds_blinking = TRUE
+
+end procedure
+
+
+; Disble the blinking mode for the seconds indicator.
+procedure indicator_seconds_blinking_disable() is
+
+   _indicator_seconds_blinking = FALSE
+
+end procedure
+
+
+
+; Switch the radio alarm 1 indicator on and stop any blinking.
+procedure indicator_radio_1_on() is
+
+   _indicator_radio_1_blinking = FALSE
+   _display_indicator = _display_indicator | INDICATOR_RADIO_1
+   _backup_indicator = _display_indicator
+
+end procedure
+
+; Switch the radio alarm 1 indicator off and stop any blinking.
+procedure indicator_radio_1_off() is
+
+   _indicator_radio_1_blinking = FALSE
+   _display_indicator = _display_indicator & !INDICATOR_RADIO_1
+   _backup_indicator = _display_indicator
+
+end procedure
+
+; Switch the radio 1 indicator to blink mode.
+procedure indicator_radio_1_blinking() is
+
+   _indicator_radio_1_blinking = TRUE
+
+end procedure
+
+
+; Switch the beep alarm 1 indicator on and stop any blinking.
+procedure indicator_beep_1_on() is
+
+   _indicator_beep_1_blinking = FALSE
+   _display_indicator = _display_indicator | INDICATOR_BEEP_1
+   _backup_indicator = _display_indicator
+
+end procedure
+
+; Switch the beep alarm 1 indicator off and stop any blinking.
+procedure indicator_beep_1_off() is
+
+   _indicator_beep_1_blinking = FALSE
+   _display_indicator = _display_indicator & !INDICATOR_BEEP_1
+   _backup_indicator = _display_indicator
+
+end procedure
+
+
+; Switch the beep 1 indicator to blink mode.
+procedure indicator_beep_1_blinking() is
+
+   _indicator_beep_1_blinking = TRUE
+
+end procedure
+
+
+; Switch the radio alarm 2 indicator on and stop any blinking.
+procedure indicator_radio_2_on() is
+
+   _indicator_radio_2_blinking = FALSE
+   _display_indicator = _display_indicator | INDICATOR_RADIO_2
+   _backup_indicator = _display_indicator
+
+end procedure
+
+; Switch the radio alarm 2 indicator off and stop any blinking.
+procedure indicator_radio_2_off() is
+
+   _indicator_radio_2_blinking = FALSE
+   _display_indicator = _display_indicator & !INDICATOR_RADIO_2
+   _backup_indicator = _display_indicator
+
+end procedure
+
+; Switch the radio 2 indicator to blink mode.
+procedure indicator_radio_2_blinking() is
+
+   _indicator_radio_2_blinking = TRUE
+
+end procedure
+
+
+; Switch the beep alarm 2 indicator on and stop any blinking.
+procedure indicator_beep_2_on() is
+
+   _indicator_beep_2_blinking = FALSE
+   _display_indicator = _display_indicator | INDICATOR_BEEP_2
+   _backup_indicator = _display_indicator
+
+end procedure
+
+; Switch the beep alarm 2 indicator off and stop any blinking.
+procedure indicator_beep_2_off() is
+
+   _indicator_beep_2_blinking = FALSE
+   _display_indicator = _display_indicator & !INDICATOR_BEEP_2
+   _backup_indicator = _display_indicator
+
+end procedure
+
+
+; Switch the beep 2 indicator to blink mode.
+procedure indicator_beep_2_blinking() is
+
+   _indicator_beep_2_blinking = TRUE
+
+end procedure
+
+
+; Switch the tens indicator on and stop any blinking.
+procedure indicator_tens_on() is
+
+   _indicator_tens_blinking = FALSE
+   _display_indicator = _display_indicator | INDICATOR_TENS
+   _backup_indicator = _display_indicator
+
+end procedure
+
+; Switch the tens indicator off and stop any blinking.
+procedure indicator_tens_off() is
+
+   _indicator_tens_blinking = FALSE
+   _display_indicator = _display_indicator & !INDICATOR_TENS
+   _backup_indicator = _display_indicator
+
+end procedure
+
+
+; Switch the tens indicator to blink mode.
+procedure indicator_tens_blinking() is
+
+   _indicator_tens_blinking = TRUE
+
+end procedure
+
+
+; Set the given display directly with the given value. 
+procedure display_set_direct(byte in display, byte in value) is
+
+   if (display == DISPLAY_MIN_UNITS) then
+      _display_min_units = DIGIT_TO_7_SEGMENT[value]
+   elsif (display == DISPLAY_MIN_TENS) then
+      _display_min_tens = DIGIT_TO_7_SEGMENT[value]
+   elsif (display == DISPLAY_HOUR_UNITS) then
+      _display_hour_units = DIGIT_TO_7_SEGMENT[value]
+   elsif (display == DISPLAY_HOUR_TENS) then
+      _display_hour_tens = DIGIT_TO_7_SEGMENT[value]
+   end if
+
+end procedure
+
+
+; Set the display hours. These are spilt over two 7-segment displays.
+procedure display_set_hours(byte in hours) is
+   
+   ; We ship a leading zero for the hours.
+   if ((hours / 10) == 0) then
+      _display_hour_tens = DIGIT_TO_7_SEGMENT[SEGMENT_OFF]
+   else
+      _display_hour_tens = DIGIT_TO_7_SEGMENT[hours / 10]
+   end if 
+   _display_hour_units = DIGIT_TO_7_SEGMENT[hours % 10]
+   
+end procedure
+
+
+; Set the display minutes. These are spilt over two 7-segment displays.
+procedure display_set_minutes(byte in minutes) is
+   
+   _display_min_tens = DIGIT_TO_7_SEGMENT[minutes / 10]
+   _display_min_units = DIGIT_TO_7_SEGMENT[minutes % 10]
+   
+end procedure
+
+
+; Set the brightness of the display. Range DISPLAY_BRIGHTNESS_OFF to
+; DISPLAY_BRIGHTNESS_MAX.
+procedure display_set_brightness(byte in brightness) is
+
+   ; The brightness it translated into a dimming value in order to have
+   ; sufficient dimming steps.
+   if (brightness == DISPLAY_BRIGHTNESS_OFF) then
+      _display_dimming_set = DISPLAY_DIMMING_OFF
+   else 
+      ; Calculate the dimming for this set brightness. 
+      ; Dimming goes up when brightness goes down.
+      _display_dimming_set = (DISPLAY_DIMMING_MAX - (DISPLAY_DIMMING_STEP * brightness))
+      _display_dimming_counter = _display_dimming_set
+   end if 
+
+end procedure
+
+
+; Return the set brightness. 
+function display_get_brightness() return byte is
+
+   var byte current_brightness
+
+   if (_display_dimming_set == DISPLAY_DIMMING_OFF) then
+      current_brightness = DISPLAY_BRIGHTNESS_OFF
+   else 
+      current_brightness = DISPLAY_BRIGHTNESS_MAX - (_display_dimming_set / DISPLAY_DIMMING_STEP)
+   end if
+
+   return current_brightness
+
+end function
+
+
+; Decrease the set brightness and current brightness of the display. If 
+; the minimumset brightness is reached the display will turn off. 
+; A next call will start again at maximum brightness.
+procedure display_decrease_brightness() is
+
+   var byte current_brightness
+   
+   current_brightness = display_get_brightness()
+   if (current_brightness == DISPLAY_BRIGHTNESS_MIN) then
+      current_brightness = DISPLAY_BRIGHTNESS_OFF
+   else
+      current_brightness = current_brightness - 1
+   end if 
+   ; Set the new brighteness (in fact set the new dimming).
+   display_set_brightness(current_brightness)
+
+end procedure
+
+
+; Return TRUE if half a second was passed. The call will clear the
+; half a second flag.
+function display_half_a_second_passed() return bit is
+
+   var bit current_half_a_second = _half_a_second_passed
+   
+   _half_a_second_passed = FALSE
+   return current_half_a_second
+
+end function
+
+
+; Display multiplexer. This procedure updates all 7-segment displays on
+; an interrupt basis. It goes from right to left, starting with the
+; tens of hours. The indicators are also updated. 
+; This routine is called every 116 us and takes about 25 us to complete.
+procedure display_update() is 
+   pragma interrupt
+
+   ; See if this interrupt is for the displays.
+   if PIR0_TMR0IF & PIE0_TMR0IE then
+      PIR0_TMR0IF = FALSE
+
+      ; Handle the blinking of the display and the indicators which is blinking
+      ; once per second (half a second on and half a second off). This timing is
+      ; also used by the main program to update the time from the RTC to the display.
+      if (_display_blink_counter == 0) then
+         _display_blink_counter = DISPLAY_BLINK_TIME
+         _half_a_second_passed = TRUE
+         ; Handle all blinks. Start with the display. 
+         if _display_blinking then
+            ; If the display is blinking then the indicators need to be 
+            ; synchronized so that it has the same blinking rithm.
+            _sync_blink = _display_control
+            _display_control = !_display_control
+         end if
+
+         ; We want the indicators to blink in sync so we use a special bit
+         ; to synchronize them all so they turn on and off at the same time.
+         ; As mentioned earlier this sync is synchronized with the display if
+         ; the display is also blinking so that it all has the same rithm.
+         _sync_blink = !_sync_blink
+
+         ; Now all indicators. Start with seconds.
+         if _indicator_seconds_blinking  then
+            if ((_display_indicator & INDICATOR_SECONDS) == 0 ) & _sync_blink then
+               ; Put it on.
+               _display_indicator = _display_indicator | INDICATOR_SECONDS
+            else
+               ; Put it off.
+               _display_indicator = _display_indicator & !INDICATOR_SECONDS
+            end if 
+         end if 
+
+         ; Radio 1.
+         if _indicator_radio_1_blinking then
+            if ((_display_indicator & INDICATOR_RADIO_1) == 0)  & _sync_blink then
+               ; Put it on.
+               _display_indicator = _display_indicator | INDICATOR_RADIO_1
+            else
+               ; Put it off.
+               _display_indicator = _display_indicator & !INDICATOR_RADIO_1
+            end if 
+         end if 
+
+         ; Beep 1.
+         if _indicator_beep_1_blinking then
+            if ((_display_indicator & INDICATOR_BEEP_1) == 0)  & _sync_blink then
+               ; Put it on.
+               _display_indicator = _display_indicator | INDICATOR_BEEP_1
+            else
+               ; Put it off.
+               _display_indicator = _display_indicator & !INDICATOR_BEEP_1
+            end if 
+         end if 
+
+         ; Radio 2.
+         if _indicator_radio_2_blinking then
+            if ((_display_indicator & INDICATOR_RADIO_2) == 0)  & _sync_blink then
+               ; Put it on.
+               _display_indicator = _display_indicator | INDICATOR_RADIO_2
+            else
+               ; Put it off.
+               _display_indicator = _display_indicator & !INDICATOR_RADIO_2
+            end if 
+         end if 
+
+         ; Beep 2.
+         if _indicator_beep_2_blinking then
+            if ((_display_indicator & INDICATOR_BEEP_2) == 0)  & _sync_blink then
+               ; Put it on.
+               _display_indicator = _display_indicator | INDICATOR_BEEP_2
+            else
+               ; Put it off.
+               _display_indicator = _display_indicator & !INDICATOR_BEEP_2
+            end if 
+         end if 
+
+         ; Indicator tens.
+         if _indicator_tens_blinking then
+            if ((_display_indicator & INDICATOR_TENS) == 0)  & _sync_blink then
+               ; Put it on.
+               _display_indicator = _display_indicator | INDICATOR_TENS
+            else
+               ; Put it off.
+               _display_indicator = _display_indicator & !INDICATOR_TENS
+            end if 
+         end if 
+
+      else
+         _display_blink_counter = _display_blink_counter - 1
+      end if
+
+      ; Do the multiplexing of the display.
+      case _display_mux_state of
+      
+         DISPLAY_MUX_HOUR_TENS: 
+         block
+            ; Switch off the previous display.
+            _display_min_1 = SCANLINE_OFF
+            _segment_display = _display_hour_tens
+            _display_hour_10 = _display_control 
+            _display_next_mux_state = DISPLAY_MUX_HOUR_UNITS
+            _display_mux_state = DISPLAY_MUX_PAUSE
+            ; Activate the indicators in this state.
+            _indicator_display = _display_indicator
+         end block
+
+         DISPLAY_MUX_HOUR_UNITS: 
+         block
+            ; Switch off the previous display.
+            _display_hour_10 = SCANLINE_OFF
+            _segment_display = _display_hour_units
+            _display_hour_1 =_display_control  
+            _display_next_mux_state = DISPLAY_MUX_MIN_TENS
+            _display_mux_state = DISPLAY_MUX_PAUSE
+         end block
+
+         DISPLAY_MUX_MIN_TENS: 
+         block
+            ; Switch off the previous display.
+            _display_hour_1 = SCANLINE_OFF
+            _segment_display = _display_min_tens
+            _display_min_10 = _display_control  
+            _display_next_mux_state = DISPLAY_MUX_MIN_UNITS
+            _display_mux_state = DISPLAY_MUX_PAUSE
+         end block
+
+         DISPLAY_MUX_MIN_UNITS: 
+         block
+            ; Switch off the previous display.
+            _display_min_10 = SCANLINE_OFF
+            _segment_display = _display_min_units
+            _display_min_1 = _display_control 
+            ; Always do at least one brightness step in case the display is off.
+            _display_next_mux_state = DISPLAY_MUX_BRIGHTNESS           
+            _display_mux_state = DISPLAY_MUX_PAUSE
+         end block
+
+         DISPLAY_MUX_BRIGHTNESS: 
+         block
+            ; Switch off the display and the indicators. This is at least
+            ; done once - or permanent - in one cycle of the state machine.
+            _display_hour_10 = SCANLINE_OFF
+            _display_hour_1 = SCANLINE_OFF
+            _display_min_10 = SCANLINE_OFF
+            _display_min_1 = SCANLINE_OFF
+            ; Indicators off.
+            _indicator_display = INDICATOR_OFF
+            if (_display_dimming_set != DISPLAY_DIMMING_OFF) then
+               ; Display not set off, check if we are done.
+               if (_display_dimming_counter == DISPLAY_DIMMING_MIN) then
+                  ; Done with this cycle, preset and continue multiplexing.
+                  _display_dimming_counter = _display_dimming_set
+                  _display_mux_state = DISPLAY_MUX_HOUR_TENS
+               else 
+                  ; Dimming count not yet done, keep display off.
+                  _display_dimming_counter = _display_dimming_counter - 1
+               end if 
+            end if 
+        end block
+
+         ; One pause cycle. This is only needed for the multiplexed display
+         ; to prevent 'ghost' numbers on another 7-segment display.
+         DISPLAY_MUX_PAUSE: 
+         block
+            ; Blanc the screen for one cycle before the next cycle.
+            _display_hour_10 = SCANLINE_OFF
+            _display_hour_1 = SCANLINE_OFF
+            _display_min_10 = SCANLINE_OFF
+            _display_min_1 = SCANLINE_OFF
+            _segment_display = DIGIT_TO_7_SEGMENT[SEGMENT_OFF]
+            _display_mux_state = _display_next_mux_state
+         end block
+
+     end case
+
+   end if 
+
+end procedure
+

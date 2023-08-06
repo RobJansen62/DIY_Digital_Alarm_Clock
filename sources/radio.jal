@@ -1,0 +1,142 @@
+;===============================================================================
+; Title: FM radio driver for the digital alarm clock.
+;
+; Author: Rob Jansen, Copyright (c) 2023..2023, all rights reserved.
+;
+; Revisions
+; ---------
+; 2023-03-12 : Initial version
+;
+; Compiler: jalv25r7
+;
+; Description: This driver provides functions for controlling the FM radio
+;
+; Sources: -
+;
+; ================== Constant and variable declarations =======================
+include rda5807m
+
+; Local constants.
+const byte _RADIO_MAX_TUNE_CHANNELS = 50
+
+; Local variables.
+var bit _radio_is_on
+
+
+; ========================= Functions and Procedures ==========================
+
+
+; Turn the radio off if it was on.
+procedure radio_off() is
+   if _radio_is_on then
+      rda5807m_mute()
+      _radio_is_on = FALSE
+   end if 
+end procedure
+
+
+; Turn the radio on if it was off.
+procedure radio_on() is
+   if !_radio_is_on then 
+      rda5807m_unmute()
+      _radio_is_on = TRUE
+   end if 
+end procedure
+
+
+; Initialize the FM radio.
+procedure radio_init() is
+
+   ; Default initialization is for Europe, so OK.
+   rda5807m_init()
+   rda5807m_mute()
+   rda5807m_set_output_mono()
+   rda5807m_disable_bass_boost()
+   rda5807m_disable_rds()
+   rda5807m_disable_soft_mute()
+   ; Maximum volume tuned to beep tone.
+   rda5807m_set_volume(RDA5807M_VOLUME_MAX - 5)
+   rda5807m_enable_output()
+   _radio_is_on = FALSE
+
+end procedure
+
+
+; Return the start frequency of the FM band in kHz. This is just a wrapper.
+function radio_get_start_of_band() return dword is
+ 
+    return rda5807m_band_frequency_low
+
+end function
+
+
+; Tune to the given frequency.
+procedure radio_set_frequency(dword in frequency) is
+ 
+   rda5807m_set_frequency(frequency)
+
+end procedure
+
+
+; Tune to the next FM channel and return the frequency in kHz
+; Note that when the whole channel is done, it starts again 
+; at the beginning of the channel. 
+; We try this a maximum number of times as to prevent a hang-up. 
+function radio_tune_to_next_channel() return dword is
+
+   var byte counter = 0
+   var bit channel_found = FALSE
+
+   while !channel_found & (counter < _RADIO_MAX_TUNE_CHANNELS) loop
+      rda5807m_seek_up()
+      ;Give the tuner some time to seek.
+      _usec_delay(100_000)
+      ; Wait for it.
+      while !rda5807m_seek_completed() loop
+         _usec_delay(10_000)
+      end loop
+      ; One spacing seeked, see if there is an FM channel on this frequency.
+      channel_found = rda5807m_channel_is_fm()
+      counter = counter + 1
+   end loop
+
+   return rda5807m_get_frequency()
+
+end function
+
+
+
+; Tune to the previous FM channel and return the frequency in kHz
+; Note that when the whole channel is done, it starts again 
+; at the end of the channel.
+; We try this a maximum number of times as to prevent a hang-up. 
+function radio_tune_to_previous_channel() return dword is
+
+   var byte counter = 0
+   var bit channel_found = FALSE
+
+   while !channel_found & (counter < _RADIO_MAX_TUNE_CHANNELS) loop
+      rda5807m_seek_down()
+      ;Give the tuner some time to seek.
+      _usec_delay(100_000)
+      ; Wait for it.
+      while !rda5807m_seek_completed() loop
+         _usec_delay(10_000)
+      end loop
+      ; One spacing seeked, see if there is an FM channel on this frequency.
+      channel_found = rda5807m_channel_is_fm()
+      counter = counter + 1
+   end loop
+
+   return rda5807m_get_frequency()
+
+end function
+
+
+; Return TRUE if the radio is on.
+function radio_is_on() return bit is
+
+   return _radio_is_on
+
+end function
+

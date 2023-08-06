@@ -1,0 +1,138 @@
+;===============================================================================
+; Title: Beep sound driver for the digital alarm clock.
+;
+; Author: Rob Jansen, Copyright (c) 2023..2023, all rights reserved.
+;
+; Revisions
+; ---------
+; 2023-02-11 : Initial version
+;
+; Compiler: jalv25r7
+;
+; Description: This driver creates the beep tone for the alarm clock. The beep 
+;              tone is turned on and off. 
+;
+; Sources: -
+;
+; ================== Constant and variable declarations =======================
+
+; PWM output.
+alias beep_output is pin_c5_direction
+
+; Reload value for the beep timer.
+const byte BEEP_RELOAD_TIME = 15
+
+; Local variables.
+var byte _beep_timer 
+var bit  _beep_is_on, _beeper_active
+
+; ========================= Functions and Procedures ==========================
+
+; Initialize the PWM hardare used for generating the beep tone. For PWM we use
+; timer 2. In order to create a beep-on and beep-off signal we will use timer 4 
+; to generate that on and off trigger.
+
+procedure beep_init() is
+
+   ; For PWM we use timer 2. We want a tone of 2 kHz or 500 us
+   ; Register T2PR holds the Timer Period using the following formula:
+   ; Period = (T2PR + 1) * 4 * Tosc * prescaler * postscaler (must be 1 for PWM)
+   ; where Tosc = 1/Fosc and Fosc = 8.000.000 Hz.
+   ; With a T2PR = 255 and prescaler = 8 and postscaler = 1
+   ; Period = (124 + 1) * 4 * 1/8.000.000 * 8 * 1 =  500 us ms or 2 kHz 
+   T2CON_T2ON    = FALSE  ; Timer 2 off
+   T2CON_T2OUTPS = 0b0000 ; Postscaler is 1
+   T2CON_T2CKPS  = 0b011  ; Prescaler is 8
+   T2CLKCON      = 0b0001 ; Clock source is Fosc/4
+   T2PR          = 124    ; Reload value.
+   ; Initialze PWM registers using PWM5.
+   ; Duty cycle is PWM5DC * Tosc * TMR2 prescale value = 250 us (50% of 2 kHz)
+   ; equals 250 = 0xFA = 0b1111_1010 ==> shift right 2 bits.
+   PWM5DCL = 0b1000_0000
+   PWM5DCH = 0b0011_1110 
+   PWM5CON_EN = TRUE ; Enable PWM. 
+   beep_output = INPUT
+   _beep_is_on = FALSE
+
+   ; For beep-on and beep-on we will use timer 4. On-off rate is set to
+   ; once per second (1 Hz or 1 second period). The timer is not started.
+   ; Register T4PR holds the Timer Period using the following formula:
+   ; Period = (T4PR + 1) * 4 * Tosc * prescaler * postscaler
+   ; where Tosc = 1/Fosc and Fosc = 8.000.000 Hz.
+   ; With a T4PR = 255 and prescaler = 32 and postscaler = 16
+   ; Period = (255 + 1) * 4 * 1/8.000.000 * 32 * 16 =  65 ms or 15 Hz 
+   ; so we need a counter to divide this further by 15 to get 1 Hz
+   T4CON_T4ON    = FALSE  ; Timer 4 off
+   T4CON_T4OUTPS = 0b1111 ; Postscaler is 16
+   T4CON_T4CKPS  = 0b101  ; Prescaler is 32
+   T4CLKCON      = 0b0010 ; Clock source is Fosc
+   T4PR          = 255    ; Reload value.
+   PIE2_TMR4IE   = TRUE   ; Enable Timer 4 interrupt
+   PIR2_TMR4IF   = FALSE  ; Clear Timer 4 interrupt flag.
+   INTCON_PEIE   = TRUE   ; Enable peripheral interrupts.
+   INTCON_GIE    = TRUE   ; Enable the global interrupt.
+   _beep_timer   = BEEP_RELOAD_TIME
+   _beeper_active = FALSE
+
+end procedure
+
+
+; Beeper routine. This puts the beeper on and off.
+procedure beeper() is
+   pragma interrupt
+
+   if PIR2_TMR4IF & PIE2_TMR4IE then
+      PIR2_TMR4IF = FALSE
+      _beep_timer = _beep_timer - 1
+      if (_beep_timer == 0) then
+         _beep_timer   = BEEP_RELOAD_TIME
+         if _beep_is_on then
+            T2CON_T2ON = FALSE
+            _beep_is_on = FALSE
+            beep_output = INPUT
+        else
+            T2CON_T2ON = TRUE
+           _beep_is_on = TRUE
+            beep_output = OUTPUT
+         end if 
+      end if
+   end if
+
+end procedure
+
+      
+; Turn the beep tone off if it was on.
+procedure beep_off() is
+
+   if _beeper_active then
+      T4CON_T4ON = FALSE
+      _beeper_active = FALSE
+      T2CON_T2ON = FALSE
+      _beep_is_on = FALSE
+      beep_output = INPUT
+   end if 
+
+end procedure
+
+
+; Turn the beep tone on if it was off.
+procedure beep_on() is
+
+   if !_beeper_active then
+      ; The output will enabled by the interrupt routine.
+      _beep_timer = BEEP_RELOAD_TIME
+      T2CON_T2ON = TRUE 
+      _beeper_active = TRUE
+      T4CON_T4ON = TRUE
+   end if 
+
+end procedure
+
+
+; Return TRUE if the beeper is on.
+function beep_is_on() return bit is
+
+   return _beeper_active
+
+end function
+

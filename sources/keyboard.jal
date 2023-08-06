@@ -1,0 +1,113 @@
+;===============================================================================
+; Title: Keyboard driver for the digital alarm clock.
+;
+; Author: Rob Jansen, Copyright (c) 2023..2023, all rights reserved.
+;
+; Revisions
+; ---------
+; 2023-02-17 : Initial version
+;
+; Compiler: jalv25r7
+;
+; Description: This module provides the functions for reading the keyboard on
+;              the alarm clock.
+;
+; Sources: -
+;
+; ================== Constant and variable declarations =======================
+
+; The keyboard is read via PORTB. Keys are active low. The keys are connected 
+; as follows:
+; -) b0 = key 0 = RADIO ON/OFF
+; -) b1 = key 1 = PRESET/SET TIME
+; -) b2 = key 2 = SNOOZE
+; -) b3 = key 3 = HOUR/TUNE+
+; -) b4 = key 4 = MIN/TUNE-
+; -) b5 = key 5 = AL2/VOL+
+; -) b6 = key 6 = AL1/VOL-
+; -) b7 = key 7 = BRIGHTNESS 
+alias keyboard is portb
+portb_direction = ALL_INPUT
+; Note that by default the external interrupt is on b0 but it has been re-assigned
+; by the main program to another pin. 
+
+; Keyboard Masks. Keys are active low.
+const KEYBOARD_KEY_RADIO             = 0b0000_0001
+const KEYBOARD_KEY_PRESET            = 0b0000_0010
+const KEYBOARD_KEY_SNOOZE            = 0b0000_0100
+const KEYBOARD_KEY_HOUR_TUNE_PLUS    = 0b0000_1000 ; Double function.
+const KEYBOARD_KEY_MINUTE_TUNE_MINUS = 0b0001_0000 ; Double function.
+const KEYBOARD_KEY_ALARM_2_VOL_PLUS  = 0b0010_0000 ; Double function.
+const KEYBOARD_KEY_ALARM_1_VOL_MINUS = 0b0100_0000 ; Double function.
+const KEYBOARD_KEY_BRIGHTNESS        = 0b1000_0000
+
+if defined(USING_PROGRAMMER) then
+   ; Temporary disable b7 and b6 since the programmer is connected.
+   const KEYBOARD_KEY_RELEASE        = 0b0011_1111
+else
+   ; Normal operation.
+   const KEYBOARD_KEY_RELEASE        = 0b1111_1111
+end if 
+
+; Some key timer constants.
+const word KEY_DEBOUNCE = 25_000 ; 25 ms.
+const byte KEY_PRESS_2S = 40     ; 2 Seconds, based on debounces of 25 ms.
+
+; ========================= Functions and Procedures ==========================
+
+; Returns TRUE if the given key was pressed. Key debouncing is handled.
+function key_pressed(byte in key) return bit is
+
+   var bit key_was_pressed = FALSE
+
+   if ((keyboard & key) == 0) then
+      ; Key pressed, debouce and check again.
+      _usec_delay(KEY_DEBOUNCE)
+       key_was_pressed = ((keyboard & key) == 0)
+   end if 
+
+   return key_was_pressed
+
+end function
+
+
+; Returns TRUE if no key was pressed (all released).
+function key_released() return bit is
+
+   var bit key_was_released = FALSE
+
+   if (keyboard == KEYBOARD_KEY_RELEASE) then
+      _usec_delay(KEY_DEBOUNCE)
+      key_was_released = (keyboard == KEYBOARD_KEY_RELEASE)
+   end if
+
+   return key_was_released
+
+end function
+
+
+; Wait for all keys to be relased.
+procedure wait_for_key_release() is
+
+   while !key_released() loop 
+      ; Empty loop.
+   end loop
+
+end procedure
+
+
+; Returns TRUE if the given key was pressed for 2 seconds.
+function key_pressed_long(byte in key) return bit is
+
+   var byte key_press_timer = 0
+
+   while key_pressed(key) &  (key_press_timer < KEY_PRESS_2S) loop
+      _usec_delay(KEY_DEBOUNCE)
+      key_press_timer = key_press_timer + 1
+   end loop
+
+   return (key_press_timer == KEY_PRESS_2S)
+
+end function
+
+
